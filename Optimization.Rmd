@@ -1,0 +1,278 @@
+---
+title: '"Optimization of raster to data frame function"'
+author: "Derek Corcoran"
+date: "`r format(Sys.time(), '%d/%m, %Y')`"
+output:
+  bookdown::html_document2:
+    fig_caption: true
+    toc: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, tidy = TRUE, tidy.opts= list(blank = FALSE, width.cutoff = 60))
+```
+
+# Objective of the function
+
+There are two objectives for this function, first to reduce the memory usage (RAM), when transforming a rasterStack into a dataframe, on the other hand we want not to reduce the speed or if possibly to increase the speed of the function.
+
+First lets load the packages we will need:
+
+```{r}
+# For spaital manipulation
+library(raster)
+# For benchmarking speed and memory
+library(bench)
+# To parallelize operations
+library(doParallel)
+# To parallelize operations
+library(foreach)
+# For combination and looping
+library(purrr)
+# Data wranggling
+library(dplyr)
+library(data.table)
+```
+
+## Tiling
+
+The main way to reduce the RAM usage is instead of processing one big raster is to transform it into tiled rasters, for that I developed the following function that you can include in you code:
+
+```{r}
+SplitRas <- function(Raster,ppside, nclus = 1){
+  TempRast <- paste0(getwd(), "/Temp")
+  h        <- ceiling(ncol(Raster)/ppside)
+  v        <- ceiling(nrow(Raster)/ppside)
+  agg      <- aggregate(Raster,fact=c(h,v))
+  agg[]    <- 1:ncell(agg)
+  agg_poly <- rasterToPolygons(agg)
+  names(agg_poly) <- "polis"
+  r_list <- list()
+  if(nclus == 1){
+    for(i in 1:ncell(agg)){
+      dir.create(TempRast)
+      rasterOptions(tmpdir=TempRast)
+      e1          <- extent(agg_poly[agg_poly$polis==i,])
+      r_list[[i]] <- crop(Raster,e1)
+      if((freq(r_list[[i]], value=NA)/ncell(r_list[[i]])) != 1){
+        writeRaster(r_list[[i]],filename=paste("SplitRas",i,sep=""),
+                  format="GTiff",datatype="FLT4S",overwrite=TRUE)
+      }
+      unlink(TempRast, recursive = T, force = T)
+    } 
+  } else if(nclus != 1){
+    cl <- parallel::makeCluster(nclus)
+    doParallel::registerDoParallel(cl)
+    r_list <- foreach(i = 1:ncell(agg), .packages = c("raster")) %dopar% {
+      dir.create(TempRast)
+      rasterOptions(tmpdir=TempRast)
+      e1          <- extent(agg_poly[agg_poly$polis==i,])
+      Temp <- crop(Raster,e1)
+      if((raster::freq(Temp, value=NA)/ncell(Temp)) != 1){
+        writeRaster(Temp,filename=paste("SplitRas",i,sep=""),
+                    format="GTiff",datatype="FLT4S",overwrite=TRUE)
+      }
+      unlink(TempRast, recursive = T, force = T)
+      Temp
+    }
+    parallel::stopCluster(cl)
+  }
+}
+```
+
+
+This function has 3 arguments:
+
+* **Raster:** The stack you want to divide into tiles
+* **ppside:** The number of horizontal and vertical tiles you will end up, the final number of tiles will be ppside*ppside, so if ppside is 3, you will have 9 tiles
+* **nclus:** The number of clusters you will use for the parallelizing and speeding up your processing.
+
+At the end of this function you will have `ppside*ppside` number of tiles, saved in your working directory all called `SplitRasN.tif` where N is the number of the tile. Just as an example we will use the bioclimatic variables available in the raster package:
+
+```{r}
+Bios <- getData('worldclim', var='bio', res=10)
+```
+
+Now I will just plot mean temperature as seen in figure \@ref(fig:Temp), but we can see that we can divide this in diferent number of tiles as shown in figure \@ref(fig:Tiles), this will generate different performances in speed and or ram usage. As we will see afterwards
+
+```{r Temp, fig.cap= "Mean temperature", echo = FALSE}
+library(rworldxtra)
+library(sf)
+library(patchwork)
+library(ggplot2)
+data("countriesHigh")
+World <- st_as_sf(countriesHigh)
+rm(countriesHigh)
+Temp <- Bios[[1]] %>% 
+  as("SpatialPixelsDataFrame") %>% 
+  as.data.frame()
+
+ggplot() +
+  geom_raster(data = Temp, aes(x =x, y = y, fill = bio1/10)) +
+  geom_sf(data = World, alpha = 0) + 
+  scale_fill_viridis_c(name = "Mean Temperature") +
+  labs(x = NULL, y = NULL) +
+  theme_bw()
+
+```
+
+
+
+```{r, echo = F, cache= TRUE}
+sides <- c(1,2,4,8,10, 12)
+
+Pols <- list()
+
+for(i in 1:length(sides)){
+  h        <- ceiling(ncol(Bios[[1]])/sides[i])
+  v        <- ceiling(nrow(Bios[[1]])/sides[i])
+  agg      <- aggregate(Bios[[1]],fact=c(h,v))
+  agg[]    <- 1:ncell(agg)
+  agg_poly <- rasterToPolygons(agg) %>% st_as_sf()
+  Pols[[i]] <- agg_poly %>% mutate(Tiles = nrow(agg_poly))
+}
+
+Pols <- do.call(rbind, Pols)
+```
+
+
+```{r Tiles, echo = F, cache= TRUE, fig.cap="Mean temerature shown with different number of tiles in red"}
+ggplot(data = Pols) +
+    geom_raster(data = Temp, aes(x =x, y = y, fill = bio1/10)) +
+    geom_sf(data = World, alpha = 0) + 
+    scale_fill_viridis_c(name = "Mean Temperature") +
+    labs(x = NULL, y = NULL) +
+    theme_bw() +
+geom_sf(data = Pols, alpha = 0, color = "red", size = 0.2) +
+    facet_wrap(~Tiles)
+
+```
+
+
+## Transformation from raster to tiles and then from tiles to dataframe
+
+so first we will use `SplitRas` function to get the 16 tiles using 4 cores:
+
+```{r}
+SplitRas(Raster = Bios, ppside = 4, nclus = 4)
+```
+
+This will return the following files: `r list.files(pattern = "SplitRas")`
+
+In order to get this tiles into one dataframe with all the non-NA cells we need a list of the tiles, which we get with:
+
+```{r}
+Files <- list.files(pattern = "SplitRas", full.names = T)
+```
+
+Which we can use then in the following function:
+
+```{r}
+SplitsToDataFrame <- function(Splits, ncores = 1){
+  TempRast <- paste0(getwd(), "/Temp")
+  if(ncores == 1){
+    Temps <- list()
+    for(i in 1:length(Splits)){
+      dir.create(TempRast)
+      rasterOptions(tmpdir=TempRast)
+      Temp <- stack(Splits[i])
+      Temp <- as.data.frame(Temp, row.names = NULL, col.names = NULL, xy =TRUE)
+      colnames(Temp)[3:ncol(Temp)] <- paste0("Var", 1:length(3:ncol(Temp)))
+      Temps[[i]] <- Temp[complete.cases(Temp),]
+      gc()
+      unlink(TempRast, recursive = T, force = T)
+      message(i)
+    }
+    Temps <- data.table::rbindlist(Temps)
+  } else if(ncores > 1){
+    cl <- parallel::makeCluster(ncores)
+    doParallel::registerDoParallel(cl)
+    Temps <- foreach(i = 1:length(Splits), .packages = c("raster", "data.table")) %dopar%{
+      dir.create(TempRast)
+      rasterOptions(tmpdir=TempRast)
+      Temp <- stack(Splits[i])
+      Temp <- as.data.frame(Temp, row.names = NULL, col.names = NULL, xy =TRUE)
+      colnames(Temp)[3:ncol(Temp)] <- paste0("Var", 1:length(3:ncol(Temp)))
+      gc()
+      unlink(TempRast, recursive = T, force = T)
+      Temp[complete.cases(Temp),]
+    }
+    Temps <- data.table::rbindlist(Temps)
+    parallel::stopCluster(cl)
+  }
+  return(Temps)
+}
+```
+
+
+Where `Splits` is a character vectors with the paths to the tiles, and `ncores` is the number of cores used for parallelization. This will result in the Data frame with the non empty cells.
+
+```{r}
+DF <- SplitsToDataFrame(Splits = Files, ncores = 4)
+```
+
+The first 20 rows of results can be seen in table \@ref(tab:Table) 
+
+```{r Table, echo = FALSE}
+library(kableExtra)
+kbl(DF[1:20,], booktabs = T, digits = 2, caption = "The first 20 observations of the resulting data frame") %>% kableExtra::kable_paper()
+```
+
+If you need to change the number of tiles, before doing so, it is recommended that you do: 
+
+```{r}
+file.remove(Files)
+```
+
+## Memory benchmarking
+
+```{r CreateTiles, echo=FALSE, cache=TRUE}
+Home <- getwd()
+AllFiles <- list()
+for(i in 1:length(sides)){
+  dir.create(path = paste0(Home, "/Sides_", sides[i]))
+  setwd(paste0(Home, "/Sides_", sides[i]))
+  SplitRas(Raster = Bios, ppside = sides[i], nclus = ifelse(sides[i] < 4, sides[i], 4))
+  AllFiles[[i]] <- list.files(pattern = "SplitRas", full.names = T) %>% stringr::str_replace_all("\\./", paste0(getwd(), "/"))
+}
+```
+
+```{r, echo=FALSE}
+setwd(Home)
+```
+
+```{r Sequential, echo= F, cache=TRUE}
+library(profvis)
+P <- profvis({
+    P1 <- SplitsToDataFrame(Splits = AllFiles[[1]])
+    P2 <- SplitsToDataFrame(Splits = AllFiles[[2]])
+    P3 <- SplitsToDataFrame(Splits = AllFiles[[3]])
+    P4 <- SplitsToDataFrame(Splits = AllFiles[[4]])
+    P5 <- SplitsToDataFrame(Splits = AllFiles[[5]])
+})
+
+P
+htmlwidgets::saveWidget(P, "profile.html")
+saveRDS(P, "P.rds")
+```
+
+```{r Parallel, echo= F, cache=TRUE}
+library(profvis)
+PPar <- profvis({
+    P1 <- SplitsToDataFrame(Splits = AllFiles[[3]], ncores = 1)
+    P2 <- SplitsToDataFrame(Splits = AllFiles[[3]], ncores = 2)
+    P3 <- SplitsToDataFrame(Splits = AllFiles[[3]], ncores = 4)
+    P4 <- SplitsToDataFrame(Splits = AllFiles[[3]], ncores = 7)
+})
+
+PPar
+htmlwidgets::saveWidget(PPar, "profileParallel.html")
+saveRDS(PPar, "PPar.rds")
+```
+
+
+```{r}
+shiny::includeHTML("profileParallel.html")
+```
+
+
